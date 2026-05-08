@@ -4,3 +4,5 @@ __pycache__/
 results/*.jsonl
 figures/*.png
 *.log
+FOLLOWUP_IDEAS.md
+*.bak
