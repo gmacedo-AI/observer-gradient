@@ -6,3 +6,5 @@ figures/*.png
 *.log
 FOLLOWUP_IDEAS.md
 *.bak
+prompt_*_preview.txt
+debug_glm.py

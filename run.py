@@ -40,7 +40,7 @@ async def call_model(client: httpx.AsyncClient, model: str, prompt: str) -> dict
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 2000,
+            "max_tokens": 10000,
         },
         timeout=120,
     )
@@ -48,8 +48,11 @@ async def call_model(client: httpx.AsyncClient, model: str, prompt: str) -> dict
     return r.json()
 
 
-def extract_aggregate(response_text: str) -> float | None:
-    """Pull aggregate score from response. Looks for submit_evaluation call or explicit number."""
+def extract_aggregate(response_text: str | None) -> float | None:
+    """Pull aggregate score from response text. Returns None if no number found
+    or if input is None/empty."""
+    if not response_text:
+        return None
     # Try JSON tool call format
     m = re.search(r'"aggregate"\s*:\s*([0-9]*\.?[0-9]+)', response_text)
     if m:
@@ -65,6 +68,59 @@ def extract_aggregate(response_text: str) -> float | None:
     return None
 
 
+def extract_from_tool_calls(message: dict) -> float | None:
+    """Extract aggregate from OpenAI-format tool_calls. Returns None if no
+    submit_evaluation call found or if aggregate field missing."""
+    tool_calls = message.get("tool_calls")
+    if not tool_calls:
+        return None
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        if fn.get("name") != "submit_evaluation":
+            continue
+        args_str = fn.get("arguments", "")
+        if not args_str:
+            continue
+        try:
+            import json
+            args = json.loads(args_str)
+            agg = args.get("aggregate")
+            if agg is not None:
+                return float(agg)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            # Fall back to regex on the raw arguments string
+            m = re.search(r'"aggregate"\s*:\s*([0-9]*\.?[0-9]+)', args_str)
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def get_aggregate_from_response(resp: dict) -> tuple[float | None, str]:
+    """Try to extract aggregate from API response, looking at both tool_calls
+    and content. Returns (aggregate, raw_text_for_logging). Text is always
+    a string, never None."""
+    message = resp["choices"][0]["message"]
+    
+    # First try tool_calls (structured output)
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        agg_from_tools = extract_from_tool_calls(message)
+        if agg_from_tools is not None:
+            text = json.dumps(tool_calls, indent=2)
+            return agg_from_tools, text
+        # tool_calls existed but extraction failed — log them anyway
+        text_fallback = json.dumps(tool_calls, indent=2)
+    else:
+        text_fallback = ""
+    
+    # Try content text
+    content = message.get("content") or ""
+    agg_from_text = extract_aggregate(content)
+    
+    # Combine both sources for logging if needed
+    final_text = content if content else text_fallback
+    return agg_from_text, final_text
+
 async def run_one(client: httpx.AsyncClient, sem: asyncio.Semaphore,
                   model_label: str, model_id: str, salience: int, run_idx: int) -> dict:
     """Single experimental run."""
@@ -74,8 +130,7 @@ async def run_one(client: httpx.AsyncClient, sem: asyncio.Semaphore,
         started = datetime.utcnow().isoformat()
         try:
             resp = await call_model(client, model_id, prompt)
-            text = resp["choices"][0]["message"]["content"]
-            aggregate = extract_aggregate(text)
+            aggregate, text = get_aggregate_from_response(resp)
             error = None
         except Exception as e:
             text = ""

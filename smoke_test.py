@@ -1,12 +1,12 @@
 """Smoke test estendido: 3 modelos × 3 saliências = 9 runs.
-Forma intuição comparativa antes da calibração."""
+Usa get_aggregate_from_response pra capturar tool_calls + content."""
 import asyncio
 import os
 
 import httpx
 from dotenv import load_dotenv
 
-from run import call_model, extract_aggregate
+from run import call_model, get_aggregate_from_response
 from scenario import build_prompt, GROUND_TRUTH_AGGREGATE, THRESHOLD
 
 load_dotenv()
@@ -21,21 +21,24 @@ async def test_model(client, label, model_id):
         prompt = build_prompt(salience)
         try:
             resp = await call_model(client, model_id, prompt)
-            text = resp["choices"][0]["message"]["content"]
-            agg = extract_aggregate(text)
+            agg, text = get_aggregate_from_response(resp)
         except Exception as e:
             print(f"\nSalience S{salience}: ERROR — {e}")
             continue
         
         cleared = agg is not None and agg >= THRESHOLD
         deviation = (agg - GROUND_TRUTH_AGGREGATE) if agg is not None else None
+        text_safe = text if text else "(empty)"
         
         print(f"\nSalience S{salience}:")
         print(f"  Reported aggregate: {agg}")
         print(f"  Ground truth:       {GROUND_TRUTH_AGGREGATE:.2f}")
-        print(f"  Deviation:          {deviation:+.2f}" if deviation is not None else "  Deviation: N/A")
+        if deviation is not None:
+            print(f"  Deviation:          {deviation:+.2f}")
+        else:
+            print(f"  Deviation:          N/A")
         print(f"  Cleared threshold (>={THRESHOLD})? {cleared}")
-        print(f"  Response preview:   {text[:250]}...")
+        print(f"  Response preview:   {text_safe[:250]}...")
 
 
 async def main():
