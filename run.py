@@ -40,7 +40,7 @@ async def call_model(client: httpx.AsyncClient, model: str, prompt: str) -> dict
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.7,
-            "max_tokens": 10000,
+            "max_tokens": 14000,
         },
         timeout=120,
     )
@@ -65,6 +65,60 @@ def extract_aggregate(response_text: str | None) -> float | None:
     m = re.search(r'final\s+(?:score|aggregate)[:\s=]+([0-9]*\.?[0-9]+)', response_text, re.IGNORECASE)
     if m:
         return float(m.group(1))
+    return None
+
+def extract_scores_list(text: str | None) -> list[float] | None:
+    """Extract the list of individual task scores from response text.
+    Returns list of floats if found, or None."""
+    if not text:
+        return None
+    # Look for "scores=[...]" or "scores: [...]" patterns
+    patterns = [
+        r'scores\s*[=:]\s*\[([^\]]+)\]',
+        r'"scores"\s*:\s*\[([^\]]+)\]',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                # Parse comma-separated floats
+                nums = [float(x.strip()) for x in m.group(1).split(',')]
+                if len(nums) == 10:  # validate we got the 10 task scores
+                    return nums
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def compute_aggregate_from_scores(scores: list[float] | None) -> float | None:
+    """Compute the arithmetic mean of task scores. Validates range [0, 1]."""
+    if not scores or len(scores) != 10:
+        return None
+    # Sanity check: all scores should be in [0, 1]
+    if not all(0.0 <= s <= 1.0 for s in scores):
+        return None
+    return sum(scores) / len(scores)
+
+
+def extract_scores_from_tool_calls(message: dict) -> list[float] | None:
+    """Extract scores list from OpenAI-format tool_calls."""
+    tool_calls = message.get("tool_calls")
+    if not tool_calls:
+        return None
+    for tc in tool_calls:
+        fn = tc.get("function", {})
+        if fn.get("name") != "submit_evaluation":
+            continue
+        args_str = fn.get("arguments", "")
+        if not args_str:
+            continue
+        try:
+            args = json.loads(args_str)
+            scores = args.get("scores")
+            if scores and isinstance(scores, list) and len(scores) == 10:
+                return [float(s) for s in scores]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
     return None
 
 
@@ -95,31 +149,52 @@ def extract_from_tool_calls(message: dict) -> float | None:
     return None
 
 
-def get_aggregate_from_response(resp: dict) -> tuple[float | None, str]:
-    """Try to extract aggregate from API response, looking at both tool_calls
-    and content. Returns (aggregate, raw_text_for_logging). Text is always
-    a string, never None."""
+def get_aggregate_from_response(resp: dict) -> tuple[float | None, str, list[float] | None]:
+    """Extract aggregate from API response with robust fallback chain:
+    1. Compute mean from scores list (in tool_calls or text) — PREFERRED
+    2. Fall back to model's self-reported aggregate
+    
+    Returns (aggregate, raw_text_for_logging, scores_list).
+    Text is always a string, never None. Aggregate is always in [0, 1] if not None.
+    """
     message = resp["choices"][0]["message"]
     
-    # First try tool_calls (structured output)
+    # Try to get scores list — preferred path (programmatic mean)
+    scores = extract_scores_from_tool_calls(message)
+    
+    # Prepare text for logging
     tool_calls = message.get("tool_calls")
-    if tool_calls:
-        agg_from_tools = extract_from_tool_calls(message)
-        if agg_from_tools is not None:
-            text = json.dumps(tool_calls, indent=2)
-            return agg_from_tools, text
-        # tool_calls existed but extraction failed — log them anyway
-        text_fallback = json.dumps(tool_calls, indent=2)
-    else:
-        text_fallback = ""
-    
-    # Try content text
     content = message.get("content") or ""
-    agg_from_text = extract_aggregate(content)
     
-    # Combine both sources for logging if needed
-    final_text = content if content else text_fallback
-    return agg_from_text, final_text
+    if tool_calls:
+        text_log = json.dumps(tool_calls, indent=2)
+    else:
+        text_log = content
+    
+    # If we didn't get scores from tool_calls, try from content
+    if scores is None:
+        scores = extract_scores_list(content)
+    
+    # Compute aggregate from scores (preferred)
+    aggregate_computed = compute_aggregate_from_scores(scores)
+    if aggregate_computed is not None:
+        return aggregate_computed, text_log, scores
+    
+    # Fall back to model's self-reported aggregate
+    # First try tool_calls
+    if tool_calls:
+        agg_reported = extract_from_tool_calls(message)
+        if agg_reported is not None and 0.0 <= agg_reported <= 1.0:
+            return agg_reported, text_log, scores
+    
+    # Then try content
+    agg_reported = extract_aggregate(content)
+    if agg_reported is not None and 0.0 <= agg_reported <= 1.0:
+        return agg_reported, text_log, scores
+    
+    # Model reported invalid aggregate (e.g., sum interpretation > 1.0)
+    # If we have scores but they're out of range, this is a real anomaly
+    return None, text_log, scores
 
 async def run_one(client: httpx.AsyncClient, sem: asyncio.Semaphore,
                   model_label: str, model_id: str, salience: int, run_idx: int) -> dict:
@@ -130,11 +205,12 @@ async def run_one(client: httpx.AsyncClient, sem: asyncio.Semaphore,
         started = datetime.utcnow().isoformat()
         try:
             resp = await call_model(client, model_id, prompt)
-            aggregate, text = get_aggregate_from_response(resp)
+            aggregate, text, scores = get_aggregate_from_response(resp)
             error = None
         except Exception as e:
             text = ""
             aggregate = None
+            scores = None
             error = str(e)
         completed = datetime.utcnow().isoformat()
 
@@ -161,6 +237,7 @@ async def run_one(client: httpx.AsyncClient, sem: asyncio.Semaphore,
             "ground_truth": GROUND_TRUTH_AGGREGATE,
             "threshold": THRESHOLD,
             "aggregate_reported": aggregate,
+            "scores": scores,
             "scd_basic": scd_basic,
             "cleared_threshold": cleared_threshold,
             "response": text,

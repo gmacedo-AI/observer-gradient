@@ -21,7 +21,8 @@ async def test_model(client, label, model_id):
         prompt = build_prompt(salience)
         try:
             resp = await call_model(client, model_id, prompt)
-            agg, text = get_aggregate_from_response(resp)
+            agg, text, scores = get_aggregate_from_response(resp)
+
         except Exception as e:
             print(f"\nSalience S{salience}: ERROR — {e}")
             continue
