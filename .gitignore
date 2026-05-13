@@ -1,10 +1,26 @@
+# Python
 __pycache__/
 .venv/
-.env
-results/*.jsonl
-figures/*.png
 *.log
+
+# Environment & secrets
+.env
+
+# Local notes (gitignored on purpose)
 FOLLOWUP_IDEAS.md
+
+# Backups & previews
 *.bak
 prompt_*_preview.txt
+
+# Local debug scripts (one-off diagnostics)
 debug_glm.py
+debug_aggregates.py
+
+# Figures auto-generated (will be added explicitly when relevant)
+figures/*.png
+
+# Results: ignore all by default, then force-add the canonical ones
+results/*.jsonl
+!results/runs_20260512_200501.jsonl
+!results/pre_pilot_20260511_174418.jsonl
