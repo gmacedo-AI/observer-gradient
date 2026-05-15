@@ -10,4 +10,6 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.26",
     "matplotlib>=3.8",
+    "scikit-posthocs>=0.13.0",
+    "statsmodels>=0.14.6",
 ]
